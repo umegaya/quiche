@@ -483,6 +483,147 @@ pub extern fn quiche_retry(
     }
 }
 
+const QUICHE_TOKEN_RAND_DATALEN: usize = 32;
+const QUICHE_TOKEN_MAGIC_RETRY: u8 = 0xb3;
+const QUICHE_RETRY_TOKEN_AEAD_ALG: crypto::Algorithm = crypto::Algorithm::AES256_GCM;
+const QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN: size_t = 1 /* conn id length */ + MAX_CONN_ID_LEN + 
+    std::mem::size_of::<u64>()/* timestamp */ + 
+    QUICHE_RETRY_TOKEN_AEAD_ALG.tag_len()/* because this buffer receives encrypted result */;
+
+#[no_mangle]
+pub extern fn quiche_generate_retry_token(
+    token: *mut u8, token_len: *mut size_t,
+    secret: *const u8, secret_len: size_t,
+    remote_addr: *const u8/* is struct sockaddr* */, remote_addr_len: size_t,
+    retry_scid: *const u8, retry_scid_len: size_t,
+    odcid: *const u8, odcid_len: size_t,
+    timestamp: u64
+) -> ssize_t {
+    //heavily rely on security of argorithm from ngtcp2_crypto_generate_retry_token
+    let mut plaintext: [u8; QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN] = [0; QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN];
+
+    //check buffer size
+    let required_token_len = 1 + QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN + QUICHE_TOKEN_RAND_DATALEN;
+    unsafe {
+        if required_token_len > *token_len {
+            return -1;
+        }
+    }
+
+    //setup input data
+    let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
+    let odcid = unsafe { slice::from_raw_parts(odcid, odcid_len) };
+    let retry_scid = unsafe { slice::from_raw_parts(retry_scid, retry_scid_len) };
+    let remote_addr = unsafe { slice::from_raw_parts(remote_addr, remote_addr_len) };
+
+    //create plaintext
+    plaintext[0] = odcid_len as u8;
+    let view = &mut plaintext[1..(1 + odcid_len)];
+    view.copy_from_slice(&odcid);
+    let view = &mut plaintext[(1 + MAX_CONN_ID_LEN)..(1 + MAX_CONN_ID_LEN + std::mem::size_of::<u64>())];
+    view.copy_from_slice(&timestamp.to_ne_bytes());
+    //FYI: this value is not equal to plaintext.len(), because original plaintext has longer buffer for aead tag
+    //its for passing crpyo::Seal.seal_with_u64_counter to specify buffer length for encryption.
+    let plaintext_len = 1 + MAX_CONN_ID_LEN + std::mem::size_of::<u64>();
+  
+    //create ad
+    let mut ad = Vec::with_capacity(remote_addr_len + retry_scid_len);
+    let view = &mut ad[..remote_addr_len];
+    view.copy_from_slice(&remote_addr);
+    let view = &mut ad[remote_addr_len..(remote_addr_len + retry_scid_len)];
+    view.copy_from_slice(retry_scid);
+
+    //2021/10/20 generate aead Seal object. this will use sha384 as digest algorithm,
+    //(OTOH, ngtcp2_crypto_generate_retry_token uses sha256)
+    let aead = match crypto::Seal::from_secret(QUICHE_RETRY_TOKEN_AEAD_ALG, &secret) {
+        Ok(v) => v,
+        Err(e) => return e.to_c()
+    };
+
+    //encrypt plaintext with using dummy counter(0)
+    match aead.seal_with_u64_counter(0, &ad, &mut plaintext, plaintext_len, None) {
+        Ok(v) => v,
+        Err(e) => return e.to_c()
+    };
+    //after here, plaintext contains encrypted contents
+  
+    //generate final token bytes
+    let token = unsafe { slice::from_raw_parts_mut(token, *token_len) };
+    token[0] = QUICHE_TOKEN_MAGIC_RETRY;
+    let view = &mut token[1..(1 + QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN)];
+    view.copy_from_slice(&plaintext);
+    rand::rand_bytes(&mut token[(1 + QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN)..(1 + QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN + QUICHE_TOKEN_RAND_DATALEN)]);
+    unsafe { *token_len = required_token_len; }
+
+    return required_token_len as ssize_t;
+}
+
+#[no_mangle]
+pub extern fn quiche_verify_retry_token(
+    odcid: *mut u8, odcid_len: *mut size_t,
+    token: *const u8, token_len: size_t,
+    secret: *const u8, secret_len: size_t,
+    remote_addr: *const u8/* is struct sockaddr* */, remote_addr_len: size_t,
+    dcid: *const u8, dcid_len: size_t,
+    token_timeout: u64, timestamp: u64
+) -> ssize_t {
+    let mut plaintext: [u8; QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN] = [0; QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN];
+
+    //check token validity
+    let token = unsafe { slice::from_raw_parts(token, token_len) };
+    let required_token_len = 1 + QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN + QUICHE_TOKEN_RAND_DATALEN;
+    if token_len < required_token_len || token[0] != QUICHE_TOKEN_MAGIC_RETRY {
+        return -1;
+    }
+    plaintext.copy_from_slice(&token[1..(1 + QUICHE_RETRY_TOKEN_AEAD_BUFFER_LEN)]);
+
+    //setup other input data
+    let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
+    let dcid = unsafe { slice::from_raw_parts(dcid, dcid_len) };
+    let remote_addr = unsafe { slice::from_raw_parts(remote_addr, remote_addr_len) };
+
+    //create ad
+    let mut ad = Vec::with_capacity(remote_addr_len + dcid_len);
+    let view = &mut ad[..remote_addr_len];
+    view.copy_from_slice(&remote_addr);
+    let view = &mut ad[remote_addr_len..(remote_addr_len + dcid_len)];
+    view.copy_from_slice(&dcid);
+
+    //2021/10/20 generate aead Open object. this will use sha384 as digest algorithm,
+    //(OTOH, ngtcp2_crypto_generate_retry_token uses sha256)
+    let aead = match crypto::Open::from_secret(QUICHE_RETRY_TOKEN_AEAD_ALG, &secret) {
+        Ok(v) => v,
+        Err(e) => return e.to_c()
+    };
+
+    //decrypt plaintext with using dummy counter(0)
+    match aead.open_with_u64_counter(0, &ad, &mut plaintext) {
+        Ok(v) => v,
+        Err(e) => return e.to_c()
+    };
+    
+    //check other validities (timestamp, buffer length)
+    let cil = plaintext[0] as size_t;
+    unsafe {
+        if *odcid_len < cil {
+            return -1;
+        }
+    }
+    let mut token_ts_buf: [u8; 8] = [0; 8];
+    token_ts_buf.copy_from_slice(&plaintext[(1 + cil)..(1 + cil + std::mem::size_of::<u64>())]);
+    let token_ts = u64::from_ne_bytes(token_ts_buf);
+    if (token_ts + token_timeout) <= timestamp {
+        return -1; //token is too old
+    }
+
+    //store verified payload as destination connection id
+    let odcid = unsafe { slice::from_raw_parts_mut(odcid, *odcid_len) };
+    let view = &mut odcid[..cil];
+    view.copy_from_slice(&plaintext[1..(1 + cil)]);
+    unsafe { *odcid_len = cil; }
+    return cil as ssize_t;
+}
+
 #[no_mangle]
 pub extern fn quiche_conn_new_with_tls(
     scid: *const u8, scid_len: size_t, odcid: *const u8, odcid_len: size_t,

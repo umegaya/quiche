@@ -99,7 +99,7 @@ impl Algorithm {
         }
     }
 
-    pub fn key_len(self) -> usize {
+    pub const fn key_len(self) -> usize {
         match self {
             Algorithm::AES128_GCM => 16,
             Algorithm::AES256_GCM => 32,
@@ -107,7 +107,7 @@ impl Algorithm {
         }
     }
 
-    pub fn tag_len(self) -> usize {
+    pub const fn tag_len(self) -> usize {
         if cfg!(feature = "fuzzing") {
             return 0;
         }
@@ -119,7 +119,7 @@ impl Algorithm {
         }
     }
 
-    pub fn nonce_len(self) -> usize {
+    pub const fn nonce_len(self) -> usize {
         match self {
             Algorithm::AES128_GCM => 12,
             Algorithm::AES256_GCM => 12,

@@ -247,6 +247,22 @@ ssize_t quiche_retry(const uint8_t *scid, size_t scid_len,
                      const uint8_t *token, size_t token_len,
                      uint32_t version, uint8_t *out, size_t out_len);
 
+// Generates a retry token.
+ssize_t quiche_generate_retry_token(uint8_t *token, size_t *token_len,
+                                    const uint8_t *secret, size_t secret_len,
+                                    const uint8_t *remote_addr/* is struct sockaddr* */, size_t remote_addr_len,
+                                    const uint8_t *retry_scid, size_t retry_scid_len,
+                                    const uint8_t *odcid, size_t odcid_len,
+                                    uint64_t timestamp);
+
+// Verifies a retry token.
+ssize_t quiche_verify_retry_token(uint8_t *odcid, size_t *odcid_len,
+                               const uint8_t *token, size_t token_len,
+                               const uint8_t *secret, size_t secret_len, 
+                               const uint8_t *remote_addr/* is struct sockaddr* */, size_t remote_addr_len,
+                               const uint8_t *dcid, size_t dcid_len,
+                               uint64_t token_timeout, uint64_t timestamp);
+
 // Returns true if the given protocol version is supported.
 bool quiche_version_is_supported(uint32_t version);
 
